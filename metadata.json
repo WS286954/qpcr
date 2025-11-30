@@ -1,0 +1,5 @@
+{
+  "name": "qRT-PCR 分析助手",
+  "description": "高级 qRT-PCR 分析工具，支持多内参基因和扩增效率校正 (Pfaffl 法)。",
+  "requestFramePermissions": []
+}
