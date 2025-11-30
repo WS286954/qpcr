@@ -7,35 +7,23 @@ import {
   FileSpreadsheet,
   Settings,
   FlaskConical,
-  BrainCircuit,
   FileText,
   ClipboardPaste,
   Info,
-  Loader2,
   Download,
   Image as ImageIcon,
-  Beaker
+  Beaker,
+  Calculator,
+  X,
+  CheckCircle2,
+  AlertTriangle,
+  XCircle
 } from "lucide-react";
-import { GoogleGenAI } from "@google/genai";
 
 // Access global libraries from CDN
 declare const jStat: any;
 declare const jspdf: any;
 declare const Chart: any;
-
-// --- Helper for Safe API Key Access ---
-const getApiKey = () => {
-  try {
-    // @ts-ignore
-    if (typeof process !== "undefined" && process.env) {
-      // @ts-ignore
-      return process.env.API_KEY;
-    }
-  } catch (e) {
-    // Ignore error if process is not defined
-  }
-  return undefined;
-};
 
 // --- Types ---
 
@@ -253,6 +241,317 @@ const generateLetterMarkings = (groupStats: GroupStatResult[]): Record<string, s
 
 // --- Components ---
 
+// Efficiency Calculator Modal
+const EfficiencyCalculator = ({
+  isOpen,
+  onClose,
+  genes,
+  initialGeneId,
+  onUpdateEfficiency
+}: {
+  isOpen: boolean;
+  onClose: () => void;
+  genes: Gene[];
+  initialGeneId?: string;
+  onUpdateEfficiency: (geneId: string, eff: number) => void;
+}) => {
+  const [selectedGeneId, setSelectedGeneId] = useState<string>(genes[0]?.id || "");
+  const [inputText, setInputText] = useState("");
+  const [dilutionFactor, setDilutionFactor] = useState(10); // Default 10-fold
+  const [result, setResult] = useState<{slope: number, r2: number, efficiency: number, effPercent: number, points: {conc: number, ct: number}[]} | null>(null);
+  const [error, setError] = useState("");
+
+  // Sync selected gene when opened with initialGeneId
+  useEffect(() => {
+    if (isOpen && initialGeneId) {
+        setSelectedGeneId(initialGeneId);
+    } else if (isOpen && !selectedGeneId && genes.length > 0) {
+        setSelectedGeneId(genes[0].id);
+    }
+  }, [isOpen, initialGeneId, genes]);
+
+  const handleCalculate = () => {
+    setError("");
+    setResult(null);
+
+    // Extract Ct values (one per line)
+    const ctValues = inputText.trim().split(/[\r\n]+/)
+        .map(v => parseFloat(v.trim()))
+        .filter(n => !isNaN(n));
+
+    if (ctValues.length < 3) {
+      setError("至少需要 3 个有效的 Ct 值来进行计算。");
+      return;
+    }
+
+    // Generate Points based on dilution factor
+    // Point 0: Relative Conc 1 (Log10 = 0)
+    // Point 1: Relative Conc 1/D (Log10 = -log10(D))
+    // Point i: ...
+    
+    const points: {x: number, y: number, conc: number}[] = ctValues.map((ct, i) => {
+        const conc = 1 / Math.pow(dilutionFactor, i);
+        return {
+            x: Math.log10(conc),
+            y: ct,
+            conc: conc
+        };
+    });
+
+    // Linear Regression
+    const n = points.length;
+    let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+    
+    points.forEach(p => {
+      sumX += p.x;
+      sumY += p.y;
+      sumXY += p.x * p.y;
+      sumXX += p.x * p.x;
+    });
+
+    const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+    const intercept = (sumY - slope * sumX) / n;
+
+    // R2 Calculation
+    let ssTotal = 0;
+    let ssResid = 0;
+    const meanY = sumY / n;
+
+    points.forEach(p => {
+      const predY = slope * p.x + intercept;
+      ssTotal += Math.pow(p.y - meanY, 2);
+      ssResid += Math.pow(p.y - predY, 2);
+    });
+
+    const r2 = 1 - (ssResid / ssTotal);
+    
+    // Efficiency Calculation
+    // E = 10^(-1/slope)
+    const efficiency = Math.pow(10, -1 / slope);
+    const effPercent = (efficiency - 1) * 100;
+
+    setResult({
+      slope,
+      r2,
+      efficiency,
+      effPercent,
+      points: points.map(p => ({ conc: p.conc, ct: p.y }))
+    });
+  };
+
+  const handleApply = () => {
+    if (result && selectedGeneId) {
+      // Limit to sensible bounds 
+      onUpdateEfficiency(selectedGeneId, parseFloat(efficiency.toFixed(3)));
+      onClose();
+    }
+  };
+  
+  // Feedback Logic
+  const getFeedback = (effPercent: number, r2: number) => {
+    const feedbacks: { type: "success" | "warning" | "error", msg: string }[] = [];
+    let overallStatus: "success" | "warning" | "error" = "success";
+
+    // Efficiency Analysis
+    if (effPercent >= 90 && effPercent <= 110) {
+        feedbacks.push({ type: "success", msg: "扩增效率 (90% - 110%): 优秀。引物特异性好，扩增效率理想。" });
+    } else if ((effPercent >= 80 && effPercent < 90) || (effPercent > 110 && effPercent <= 120)) {
+        overallStatus = "warning";
+        feedbacks.push({ type: "warning", msg: "扩增效率 (80% - 120%): 可接受。略有偏差，可能存在引物二聚体或操作误差。" });
+    } else {
+        overallStatus = "error";
+        feedbacks.push({ type: "error", msg: "扩增效率异常 (<80% 或 >120%): 不推荐使用。可能存在严重的引物二聚体、抑制剂或非特异性扩增。" });
+    }
+
+    // R2 Analysis
+    if (r2 < 0.98) {
+        overallStatus = overallStatus === "error" ? "error" : "warning";
+        feedbacks.push({ type: "warning", msg: "R² < 0.98: 线性关系一般。可能存在移液误差或稀释梯度不准确。" });
+    } else {
+        feedbacks.push({ type: "success", msg: "R² ≥ 0.98: 线性关系良好。标准曲线拟合度高。" });
+    }
+
+    return { overallStatus, feedbacks };
+  };
+
+  if (!isOpen) return null;
+
+  const efficiency = result?.efficiency || 0;
+  const feedback = result ? getFeedback(result.effPercent, result.r2) : null;
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4 animate-in fade-in duration-200">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-hidden flex flex-col max-h-[90vh]">
+        <div className="bg-slate-50 border-b border-slate-200 p-4 flex justify-between items-center">
+          <h3 className="font-bold text-slate-800 flex items-center gap-2">
+            <Calculator className="w-5 h-5 text-indigo-600"/>
+            标准曲线效率计算器
+          </h3>
+          <button onClick={onClose} className="text-slate-400 hover:text-slate-600 transition-colors">
+            <X className="w-5 h-5"/>
+          </button>
+        </div>
+        
+        <div className="p-6 overflow-y-auto">
+           <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-slate-700 mb-1">选择基因</label>
+                <select 
+                  value={selectedGeneId}
+                  onChange={(e) => setSelectedGeneId(e.target.value)}
+                  className="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none bg-white"
+                >
+                  {genes.map(g => (
+                    <option key={g.id} value={g.id}>{g.name} ({g.type === 'reference' ? '内参' : '目标'})</option>
+                  ))}
+                </select>
+              </div>
+
+              <div className="flex gap-4">
+                 <div className="w-1/3">
+                    <label className="block text-sm font-medium text-slate-700 mb-1">梯度稀释倍数</label>
+                    <div className="relative">
+                        <input
+                           type="number"
+                           min="2"
+                           value={dilutionFactor}
+                           onChange={(e) => setDilutionFactor(Math.max(2, parseInt(e.target.value) || 10))}
+                           className="w-full border border-slate-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                        />
+                        <span className="absolute right-3 top-2 text-slate-400 text-sm">X</span>
+                    </div>
+                    <p className="text-[10px] text-slate-400 mt-1">默认为10倍稀释 (1, 0.1, 0.01...)</p>
+                 </div>
+                 <div className="flex-1">
+                    <label className="block text-sm font-medium text-slate-700 mb-1">
+                      输入 Ct 值
+                      <span className="ml-2 text-xs font-normal text-slate-500">(按相对浓度从高到低排列)</span>
+                    </label>
+                    <textarea
+                      value={inputText}
+                      onChange={(e) => setInputText(e.target.value)}
+                      placeholder={`22.5\n25.8\n29.1\n32.5`}
+                      className="w-full h-32 border border-slate-300 rounded-lg px-3 py-2 font-mono text-sm focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                    />
+                    <p className="text-xs text-slate-400 mt-1">直接粘贴一列 Ct 值即可。</p>
+                 </div>
+              </div>
+
+              {error && (
+                <div className="p-3 bg-red-50 text-red-600 text-sm rounded-lg border border-red-100 flex items-center gap-2">
+                   <AlertTriangle className="w-4 h-4"/> {error}
+                </div>
+              )}
+
+              {result && (
+                <div className="space-y-4 animate-in fade-in slide-in-from-bottom-2">
+                    {/* Data Preview */}
+                    <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 text-xs">
+                        <table className="w-full text-right">
+                            <thead className="text-slate-500 border-b border-slate-200">
+                                <tr>
+                                    <th className="pb-1">相对浓度</th>
+                                    <th className="pb-1 pr-4">Log(Conc)</th>
+                                    <th className="pb-1">Ct 值</th>
+                                </tr>
+                            </thead>
+                            <tbody className="font-mono text-slate-700">
+                                {result.points.map((p, i) => (
+                                    <tr key={i}>
+                                        <td className="py-1">{p.conc.toString()}</td>
+                                        <td className="py-1 pr-4">{Math.log10(p.conc).toFixed(2)}</td>
+                                        <td className="py-1 font-bold">{p.ct.toFixed(2)}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+
+                    {/* Results Box */}
+                    <div className="bg-indigo-50 border border-indigo-100 rounded-lg p-4 space-y-2">
+                      <div className="flex justify-between items-center border-b border-indigo-100 pb-2">
+                        <span className="text-sm text-indigo-700">斜率 (Slope):</span>
+                        <span className="font-mono font-medium text-indigo-900">{result.slope.toFixed(4)}</span>
+                      </div>
+                      <div className="flex justify-between items-center border-b border-indigo-100 pb-2">
+                        <span className="text-sm text-indigo-700">R² (拟合度):</span>
+                        <span className={`font-mono font-medium ${result.r2 > 0.98 ? "text-green-600" : "text-amber-600"}`}>
+                          {result.r2.toFixed(4)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between items-center pt-1">
+                        <span className="text-sm font-bold text-indigo-800">计算扩增效率 (E):</span>
+                        <div className="text-right">
+                          <div className="font-bold text-xl text-indigo-600">{result.efficiency.toFixed(3)}</div>
+                          <div className="text-xs text-indigo-500">({result.effPercent.toFixed(1)}%)</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Analysis Feedback Box */}
+                    {feedback && (
+                        <div className={`rounded-lg p-4 border ${
+                            feedback.overallStatus === "success" ? "bg-green-50 border-green-200" :
+                            feedback.overallStatus === "warning" ? "bg-amber-50 border-amber-200" :
+                            "bg-red-50 border-red-200"
+                        }`}>
+                            <h4 className={`text-sm font-bold flex items-center gap-2 mb-2 ${
+                                feedback.overallStatus === "success" ? "text-green-800" :
+                                feedback.overallStatus === "warning" ? "text-amber-800" :
+                                "text-red-800"
+                            }`}>
+                                {feedback.overallStatus === "success" && <CheckCircle2 className="w-4 h-4"/>}
+                                {feedback.overallStatus === "warning" && <AlertTriangle className="w-4 h-4"/>}
+                                {feedback.overallStatus === "error" && <XCircle className="w-4 h-4"/>}
+                                数据质量分析建议
+                            </h4>
+                            <ul className="space-y-2">
+                                {feedback.feedbacks.map((item, idx) => (
+                                    <li key={idx} className="flex items-start gap-2 text-xs">
+                                        <span className={`mt-0.5 w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                                            item.type === "success" ? "bg-green-500" :
+                                            item.type === "warning" ? "bg-amber-500" :
+                                            "bg-red-500"
+                                        }`}/>
+                                        <span className={
+                                            item.type === "success" ? "text-green-700" :
+                                            item.type === "warning" ? "text-amber-700" :
+                                            "text-red-700"
+                                        }>
+                                            {item.msg}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+                </div>
+              )}
+           </div>
+        </div>
+
+        <div className="bg-slate-50 border-t border-slate-200 p-4 flex justify-end gap-3">
+          <button 
+             onClick={handleCalculate}
+             className="px-4 py-2 bg-white border border-slate-300 text-slate-700 rounded-lg hover:bg-slate-50 transition font-medium"
+          >
+             计算
+          </button>
+          <button 
+             onClick={handleApply}
+             disabled={!result}
+             className={`px-4 py-2 rounded-lg text-white font-medium transition shadow-sm ${
+               !result ? "bg-slate-300 cursor-not-allowed" : "bg-indigo-600 hover:bg-indigo-700"
+             }`}
+          >
+             应用结果
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // 1. Setup Panel (Step 2)
 const SetupPanel = ({
   genes,
@@ -265,6 +564,14 @@ const SetupPanel = ({
   groups: Group[];
   setGroups: React.Dispatch<React.SetStateAction<Group[]>>;
 }) => {
+  const [showCalculator, setShowCalculator] = useState(false);
+  const [calcTargetGeneId, setCalcTargetGeneId] = useState<string>("");
+
+  const openCalculator = (geneId?: string) => {
+    setCalcTargetGeneId(geneId || "");
+    setShowCalculator(true);
+  };
+
   const addGene = () => {
     setGenes([
       ...genes,
@@ -319,8 +626,20 @@ const SetupPanel = ({
     setGenes(newGenes);
   };
 
+  const updateGeneEfficiency = (id: string, eff: number) => {
+    setGenes(genes.map((g) => (g.id === id ? { ...g, efficiency: eff } : g)));
+  };
+
   return (
-    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+    <div className="space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500 relative">
+      <EfficiencyCalculator 
+         isOpen={showCalculator} 
+         onClose={() => setShowCalculator(false)}
+         genes={genes}
+         initialGeneId={calcTargetGeneId}
+         onUpdateEfficiency={updateGeneEfficiency}
+      />
+
       {/* Gene Setup */}
       <section className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
         <div className="flex justify-between items-center mb-4">
@@ -337,12 +656,21 @@ const SetupPanel = ({
               </span>
             </p>
           </div>
-          <button
-            onClick={addGene}
-            className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 transition-colors font-medium text-sm"
-          >
-            <Plus className="w-4 h-4" /> 添加基因
-          </button>
+          <div className="flex gap-2">
+            <button
+               onClick={() => openCalculator()}
+               className="flex items-center gap-2 px-3 py-1.5 text-sm bg-white border border-indigo-200 text-indigo-700 rounded-lg hover:bg-indigo-50 hover:border-indigo-300 transition-all shadow-sm font-medium"
+            >
+               <Calculator className="w-4 h-4"/>
+               效率计算器
+            </button>
+            <button
+                onClick={addGene}
+                className="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-lg hover:bg-indigo-100 transition-colors font-medium text-sm"
+            >
+                <Plus className="w-4 h-4" /> 添加基因
+            </button>
+          </div>
         </div>
 
         <div className="overflow-x-auto">
@@ -395,23 +723,32 @@ const SetupPanel = ({
                     </select>
                   </td>
                   <td className="py-3">
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="1"
-                      max="3"
-                      value={gene.efficiency}
-                      onChange={(e) =>
-                        updateGene(
-                          gene.id,
-                          "efficiency",
-                          parseFloat(e.target.value)
-                        )
-                      }
-                      onPaste={(e) => handleEfficiencyPaste(e, gene.id)}
-                      className="bg-transparent border border-slate-200 rounded px-2 py-1 w-24 text-right focus:border-indigo-500 focus:outline-none transition-all focus:ring-2 focus:ring-indigo-100"
-                      placeholder="e.g. 2.0"
-                    />
+                    <div className="flex items-center gap-2">
+                        <input
+                            type="number"
+                            step="0.01"
+                            min="1"
+                            max="3"
+                            value={gene.efficiency}
+                            onChange={(e) =>
+                                updateGene(
+                                gene.id,
+                                "efficiency",
+                                parseFloat(e.target.value)
+                                )
+                            }
+                            onPaste={(e) => handleEfficiencyPaste(e, gene.id)}
+                            className="bg-transparent border border-slate-200 rounded px-2 py-1 w-24 text-right focus:border-indigo-500 focus:outline-none transition-all focus:ring-2 focus:ring-indigo-100"
+                            placeholder="e.g. 2.0"
+                        />
+                        <button 
+                           onClick={() => openCalculator(gene.id)}
+                           className="text-slate-300 hover:text-indigo-600 transition-colors p-1 rounded hover:bg-indigo-50"
+                           title="计算此基因的扩增效率"
+                        >
+                            <Calculator className="w-4 h-4"/>
+                        </button>
+                    </div>
                   </td>
                   <td className="py-3 text-right pr-2">
                     <button
@@ -707,7 +1044,7 @@ const DataInputPanel = ({
   };
 
   return (
-    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-500">
+    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden animate-in fade-in slide-in-from-bottom-4 duration-500 relative">
       <div className="p-4 border-b border-slate-200 bg-slate-50 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
           <h2 className="font-bold text-slate-800 flex items-center gap-2">
@@ -716,7 +1053,7 @@ const DataInputPanel = ({
           </h2>
           <p className="text-xs text-slate-500 mt-1 flex items-center gap-1">
              <ClipboardPaste className="w-3 h-3"/> 
-             支持从 Excel 直接粘贴 Ct 值（整块数据）。请在此处添加分组并录入数据。
+             支持从 Excel 直接粘贴 Ct 值。请在此处添加分组并录入数据。
           </p>
         </div>
       </div>
@@ -882,8 +1219,6 @@ const ResultsPanel = ({
   samples: Sample[];
 }) => {
   const [results, setResults] = useState<AnalysisResult[]>([]);
-  const [aiExplanation, setAiExplanation] = useState<string>("");
-  const [loadingAi, setLoadingAi] = useState(false);
   const chartRef = useRef<HTMLCanvasElement>(null);
   const chartInstance = useRef<any>(null);
 
@@ -1355,54 +1690,6 @@ const ResultsPanel = ({
 
   }, [results, groups]);
 
-  // --- AI Analysis ---
-  const runAiAnalysis = async () => {
-    const apiKey = getApiKey();
-    if (!apiKey) {
-      alert("请配置 API Key 以使用 AI 功能。");
-      return;
-    }
-    setLoadingAi(true);
-    setAiExplanation("");
-
-    try {
-      const ai = new GoogleGenAI({ apiKey });
-      
-      let prompt = `作为一名资深分子生物学家，请分析以下 qRT-PCR 结果。\n\n`;
-      if (groups.length > 2) {
-          prompt += `统计方法：One-way ANOVA 显著后进行两两比较，使用字母标记法 (Compact Letter Display)。\n`;
-          prompt += `说明：共享相同字母的组之间无显著差异 (P>0.05)；不共享字母的组存在显著差异。\n\n`;
-      } else {
-          prompt += `统计方法：Welch's t-test (vs Control)。显著性标记：* p<0.05, ** p<0.01。\n\n`;
-      }
-      
-      results.forEach(res => {
-        prompt += `目标基因：${res.geneName}`;
-        if(res.anovaPValue) prompt += ` (ANOVA P = ${formatPValue(res.anovaPValue)})`;
-        prompt += `\n`;
-        res.groupResults.forEach(gr => {
-          let mark = groups.length > 2 ? `标记字母: [${gr.markingLetter}]` : `P值: ${formatPValue(gr.pValue)} (${gr.significance})`;
-          prompt += `  - 分组：${gr.groupName}, 倍数：${gr.meanNormalizedExpression.toFixed(2)} ± ${gr.sem.toFixed(2)}, ${mark}\n`;
-        });
-        prompt += `\n`;
-      });
-      
-      prompt += `请提供科学解读。哪些基因发生了显著变化？请特别注意字母标记所指示的显著性差异。说明生物学意义。用中文回答。`;
-
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: prompt,
-      });
-
-      setAiExplanation(response.text || "未生成响应。");
-    } catch (e) {
-      console.error(e);
-      setAiExplanation("AI 分析失败，请重试。");
-    } finally {
-      setLoadingAi(false);
-    }
-  };
-
   if (results.length === 0) {
     return (
       <div className="p-12 text-center text-slate-400 bg-slate-50 rounded-xl border border-dashed border-slate-300">
@@ -1527,34 +1814,6 @@ const ResultsPanel = ({
             </tbody>
           </table>
         </div>
-      </div>
-
-      {/* AI Section */}
-      <div className="bg-gradient-to-br from-indigo-50 to-white p-6 rounded-xl shadow-sm border border-indigo-100">
-        <div className="flex justify-between items-start mb-4">
-            <h3 className="text-lg font-bold text-indigo-900 flex items-center gap-2">
-              <BrainCircuit className="w-6 h-6 text-indigo-600" />
-              AI 智能解读 (Gemini)
-            </h3>
-            <button 
-              onClick={runAiAnalysis}
-              disabled={loadingAi}
-              className="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-indigo-700 transition-colors disabled:opacity-50 flex items-center gap-2"
-            >
-              {loadingAi ? <Loader2 className="w-4 h-4 animate-spin"/> : <BrainCircuit className="w-4 h-4"/>}
-              {loadingAi ? "正在分析..." : "开始智能分析"}
-            </button>
-        </div>
-        
-        {aiExplanation ? (
-          <div className="prose prose-sm max-w-none text-slate-700 bg-white p-4 rounded-lg border border-indigo-50 shadow-sm">
-             <div className="whitespace-pre-wrap leading-relaxed">{aiExplanation}</div>
-          </div>
-        ) : (
-          <p className="text-sm text-indigo-400 italic">
-            AI 将综合统计结果（ANOVA P值、字母标记、倍数变化）为您提供一份类似于发表级文章的生物学结论描述。
-          </p>
-        )}
       </div>
     </div>
   );
